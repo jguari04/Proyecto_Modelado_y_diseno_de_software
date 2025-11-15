@@ -1,0 +1,146 @@
+# finanzasportable/services/ingestor_excel.py
+# -*- coding: utf-8 -*-
+"""
+Ingestor de Excel “respetuoso del diseño”.
+Lee hojas con encabezados dispersos y extrae una tabla normalizada:
+[date, account, description, amount, currency].
+Uso desde GUI:
+    from finanzasportable.services.ingestor_excel import ingest_excel_to_db
+    n_acc, n_tx, report = ingest_excel_to_db(path, default_account="General", default_currency="ARS")
+"""
+
+from __future__ import annotations
+from pathlib import Path
+from datetime import datetime, timedelta
+import re
+from decimal import Decimal, InvalidOperation
+
+import openpyxl
+
+# --- utilitarios locales (pequeños y testeables) ---
+HEAD_SYNONYMS = {
+    "date": ["fecha", "date", "posted", "f. contable", "f. operación", "f operacion"],
+    "description": ["descripción", "descripcion", "concepto", "detalle", "memo", "glosa"],
+    "amount": ["monto", "importe", "amount", "valor", "debe", "haber"],
+    "currency": ["moneda", "currency", "divisa"],
+    "account": ["cuenta", "account", "banco", "wallet", "tarjeta", "origen"],
+}
+
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", str(s or "")).strip().lower()
+
+def _guess_role(cell_value: str) -> str | None:
+    c = _norm(cell_value)
+    for role, keys in HEAD_SYNONYMS.items():
+        if any(k in c for k in keys):
+            return role
+    return None
+
+def _parse_amount(s) -> float | None:
+    if s is None:
+        return None
+    s = str(s).strip().replace("ARS","").replace("USD","").replace("$","").replace("€","").replace("U$S","").replace("\xa0"," ").strip()
+    if re.search(r",\d{1,2}$", s) and "." in s:
+        s = s.replace(".","").replace(",",".")
+    elif s.count(",")==1 and s.count(".")==0:
+        s = s.replace(",",".")
+    s = re.sub(r"[ \u00A0’']", "", s)
+    try:
+        return float(Decimal(s))
+    except (InvalidOperation, ValueError):
+        return None
+
+def _parse_date(x):
+    if x is None or str(x).strip()=="":
+        return None
+    if isinstance(x, datetime):
+        return x.date().isoformat()
+    if isinstance(x, (int, float)):
+        try:
+            base = datetime(1899, 12, 30)
+            return (base + timedelta(days=float(x))).date().isoformat()
+        except Exception:
+            pass
+    s = str(x).strip()
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(s.replace(".", "/").replace("-", "/") if "m-%Y" in fmt else s, fmt).date().isoformat()
+        except Exception:
+            pass
+    return None
+
+def _find_header_row(ws) -> tuple[int | None, dict]:
+    best = (None, {})
+    for r in range(1, min(ws.max_row, 200) + 1):
+        mapping = {}
+        for c in range(1, min(ws.max_column, 100) + 1):
+            val = ws.cell(r, c).value
+            if val is None:
+                continue
+            role = _guess_role(val)
+            if role and role not in mapping:
+                mapping[role] = c
+        if len(mapping) >= 2 and ("amount" in mapping or "date" in mapping):
+            return r, mapping
+        if len(mapping) > len(best[1]):
+            best = (r, mapping)
+    return best
+
+def _harvest(ws, header_row, mapping, defaults):
+    out = []
+    empty_run = 0
+    for r in range(header_row + 1, ws.max_row + 1):
+        vals = {role: ws.cell(r, col).value for role, col in mapping.items()}
+        if all((vals.get(k) in (None, "", " ") for k in ("date", "description", "amount"))):
+            empty_run += 1
+            if empty_run >= 3:
+                break
+            continue
+        empty_run = 0
+        out.append({
+            "date": _parse_date(vals.get("date")),
+            "account": (str(vals.get("account") or "").strip() or defaults["account"]),
+            "description": str(vals.get("description") or "").strip(),
+            "amount": _parse_amount(vals.get("amount")),
+            "currency": (str(vals.get("currency") or "").strip().upper() or defaults["currency"]),
+        })
+    # filtrar filas totalmente vacías
+    out = [r for r in out if any(v not in (None, "", " ") for v in r.values())]
+    return out
+
+def read_excel_loose(path: Path, sheet: str | None, default_account="General", default_currency="ARS"):
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    sheets = [sheet] if sheet else wb.sheetnames
+    all_rows, report = [], []
+    defaults = {"account": default_account, "currency": default_currency}
+    for sname in sheets:
+        ws = wb[sname]
+        hrow, mapping = _find_header_row(ws)
+        report.append({"sheet": sname, "header_row": hrow, "mapping": mapping})
+        if not mapping:
+            continue
+        rows = _harvest(ws, hrow, mapping, defaults)
+        for r in rows:
+            r["_sheet"] = sname
+        all_rows.extend(rows)
+    return all_rows, report
+
+# -------- Integración con tu BD SQLite ----------
+def ingest_excel_to_db(path: str | Path, sheet: str | None = None, default_account="General", default_currency="ARS"):
+    """
+    Lee un Excel 'complejo' y vuelca a la BD general.
+    Devuelve: (n_cuentas_nuevas, n_movimientos_insertados, reporte_detectado)
+    """
+    from finanzasportable.services.db import connect, ensure_schema, clone_core_from_general, db_empty_of_core_tables, db_path_general
+    from finanzasportable.services.importer import import_rows
+
+    rows, report = read_excel_loose(Path(path), sheet, default_account, default_currency)
+    # descartar registros sin fecha o sin monto
+    clean = [r for r in rows if r.get("date") and (r.get("amount") is not None)]
+    db = db_path_general()
+    ensure_schema(db)
+    if db_empty_of_core_tables(db):
+        clone_core_from_general(db)
+    with connect(db) as con:
+        n_acc, n_tx = import_rows(con, clean)
+    return n_acc, n_tx, report

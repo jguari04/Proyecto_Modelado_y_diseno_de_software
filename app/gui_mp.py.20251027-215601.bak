@@ -1,0 +1,187 @@
+# Activar entorno y ruta base
+
+source .venv/bin/activate 2>/dev/null || true
+export PYTHONPATH="$PWD/src:$PYTHONPATH"
+
+# Reescribir el archivo limpio y corregido
+python3 - <<'PY'
+from pathlib import Path
+
+CODE = '''# -*- coding: utf-8 -*-
+from __future__ import annotations
+import sys, json, tkinter as tk
+from tkinter import ttk, messagebox
+from datetime import date, datetime
+from pathlib import Path
+import ttkbootstrap as tb
+from ttkbootstrap.constants import *
+
+# --- asegurar src en sys.path ---
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+# --- imports del proyecto ---
+from finanzasportable.services.db import (
+    connect, ensure_schema, db_path_general, db_path_year, db_path_month
+)
+from finanzasportable.utils.formats import money, parse_amount
+# --- asegurar import de paquete (buscar carpeta src hacia arriba) ---
+import sys as _sys
+from pathlib import Path as _Path
+_PRJ_ROOT = _Path(__file__).resolve().parents[1]
+_SRC = _PRJ_ROOT / 'src'
+if str(_SRC) not in _sys.path:
+    _sys.path.insert(0, str(_SRC))
+
+
+
+def build_section(parent, title):
+    wrap = ttk.Frame(parent, padding=(8, 6, 8, 8))
+    ttk.Label(wrap, text=title, font=("Helvetica", 10, "bold")).pack(anchor="w")
+    ttk.Separator(wrap).pack(fill="x", pady=4)
+    body = ttk.Frame(wrap)
+    body.pack(fill=tk.BOTH, expand=True)
+    return wrap, body
+
+
+class MPApp(tb.Window):
+    def __init__(self):
+        super().__init__(title="Finanzas Portable — Jose Guari", themename="darkly")
+        self.geometry("1200x720")
+        today = date.today()
+        self.scope_mode = tk.StringVar(value="month")
+        self.scope_year = tk.IntVar(value=today.year)
+        self.scope_month = tk.IntVar(value=today.month)
+        self.db_path = self.current_path()
+        ensure_schema(self.db_path)
+        self._build_header()
+        self._build_body()
+        self.refresh_all()
+
+    def current_path(self):
+        if self.scope_mode.get() == "general":
+            return db_path_general()
+        elif self.scope_mode.get() == "year":
+            return db_path_year(self.scope_year.get())
+        return db_path_month(self.scope_year.get(), self.scope_month.get())
+
+    def _build_header(self):
+        hdr = ttk.Frame(self, padding=10)
+        hdr.pack(fill="x")
+
+        left = ttk.Frame(hdr)
+        left.pack(side="left", fill="x", expand=True)
+        ttk.Label(left, text="Disponible", font=("Helvetica", 10, "bold")).pack(anchor="w")
+        self.total_var = tk.StringVar(value="$ 0,00")
+        ttk.Label(left, textvariable=self.total_var, font=("Helvetica", 26, "bold")).pack(anchor="w", pady=(2, 0))
+
+        right = ttk.Frame(hdr)
+        right.pack(side="right")
+
+        top = ttk.Frame(right)
+        top.pack(anchor="e", pady=(0, 6))
+        ttk.Label(top, text="Ámbito de datos:").pack(side="left", padx=(0, 6))
+        cmb = ttk.Combobox(top, width=10, state="readonly", values=["General", "Año", "Mes"])
+        cmb.current(2)
+        cmb.pack(side="left")
+        cmb.bind("<<ComboboxSelected>>", lambda e: self._on_scope_change(cmb.get()))
+
+        self.year_sp = ttk.Spinbox(top, from_=2000, to=2100, width=6, textvariable=self.scope_year, command=self.refresh_all)
+        self.month_sp = ttk.Spinbox(top, from_=1, to=12, width=4, textvariable=self.scope_month, command=self.refresh_all)
+        ttk.Label(top, text="Año").pack(side="left", padx=(8, 2))
+        self.year_sp.pack(side="left")
+        ttk.Label(top, text="Mes").pack(side="left", padx=(8, 2))
+        self.month_sp.pack(side="left")
+
+        btns = ttk.Frame(right)
+        btns.pack(anchor="e")
+        ttk.Button(btns, text="Añadir", bootstyle=SUCCESS, command=self.open_add_modal).pack(side="left", padx=6)
+        ttk.Button(btns, text="Actualizar", bootstyle=PRIMARY, command=self.refresh_all).pack(side="left", padx=6)
+
+    def _on_scope_change(self, sel):
+        if sel == "General":
+            self.scope_mode.set("general")
+        elif sel == "Año":
+            self.scope_mode.set("year")
+        else:
+            self.scope_mode.set("month")
+        self.refresh_all()
+
+    def _build_body(self):
+        body = ttk.Frame(self, padding=(10, 0, 10, 10))
+        body.pack(fill=tk.BOTH, expand=True)
+
+        left_wrap, left_body = build_section(body, "Saldos por cuenta")
+        left_wrap.pack(side="left", fill="y")
+        self.left_canvas = tk.Canvas(left_body, borderwidth=0, highlightthickness=0)
+        vsb = ttk.Scrollbar(left_body, orient="vertical", command=self.left_canvas.yview)
+        self.left_canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self.left_canvas.pack(side="left", fill="y")
+        self.left_container = ttk.Frame(self.left_canvas)
+        self.left_container.bind("<Configure>", lambda e: self.left_canvas.configure(scrollregion=self.left_canvas.bbox("all")))
+        self.left_canvas.create_window((0, 0), window=self.left_container, anchor="nw")
+
+        center_wrap, center_body = build_section(body, "Tu última actividad")
+        center_wrap.pack(side="left", fill=tk.BOTH, expand=True, padx=(10, 0))
+        cols = ("fecha", "desc", "tipo", "monto", "cuenta")
+        self.tv = ttk.Treeview(center_body, columns=cols, show="headings", height=18)
+        for key, title in zip(cols, ["Fecha", "Descripción", "Tipo", "Monto", "Cuenta"]):
+            self.tv.heading(key, text=title)
+        self.tv.pack(fill=tk.BOTH, expand=True)
+        self.tv.tag_configure("ingreso", foreground="#31c48d")
+        self.tv.tag_configure("egreso", foreground="#e02424")
+        self.tv.tag_configure("neutro", foreground="#cbd5e1")
+
+    def refresh_all(self):
+        self.db_path = self.current_path()
+        ensure_schema(self.db_path)
+        self._load_balances()
+        self._load_activity()
+
+    def _load_balances(self):
+        for w in self.left_container.winfo_children():
+            w.destroy()
+        total = 0.0
+        rows = listar_transacciones(self.db_path)
+        for _id, name, curr, bal, _m in rows:
+            total += bal or 0
+            card = ttk.Frame(self.left_container, padding=6, bootstyle=SECONDARY)
+            card.pack(fill="x", pady=4)
+            ttk.Label(card, text=name, font=("Helvetica", 10, "bold")).pack(anchor="w")
+            ttk.Label(card, text=curr).pack(anchor="w")
+            ttk.Label(card, text=money(bal, curr), font=("Helvetica", 12, "bold")).pack(anchor="w")
+        self.total_var.set(money(total))
+
+    def _load_activity(self):
+        for i in self.tv.get_children():
+            self.tv.delete(i)
+        rows = listar_transacciones(self.db_path)
+        for f, d, a, c in rows:
+            tag = "ingreso" if a > 0 else "egreso" if a < 0 else "neutro"
+            tipo = "Ingreso" if a > 0 else "Egreso" if a < 0 else "—"
+            self.tv.insert("", "end", values=(f, d, tipo, money(a), c), tags=(tag,))
+
+    def open_add_modal(self):
+        win = tb.Toplevel(self)
+        win.title("Añadir movimiento")
+        win.transient(self)
+        win.grab_set()
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frm, text="(Formulario no implementado aún)").pack(pady=10)
+        ttk.Button(frm, text="Cerrar", command=win.destroy).pack(pady=6)
+
+
+if __name__ == "__main__":
+    app = MPApp()
+    app.mainloop()
+'''
+Path("app/gui_mp.py").write_text(CODE, encoding="utf-8")
+print("✅ gui_mp.py restaurado correctamente")
+PY
+
+# Ejecutar la app
+python3 -m app.gui_mp

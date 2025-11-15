@@ -1,0 +1,20 @@
+# Entorno virtual (no se sube nunca)
+.venv/
+venv/
+
+# Cachés de Python / pytest
+__pycache__/
+.pytest_cache/
+
+# Archivos binarios grandes o innecesarios para el TP
+*.jar
+*.exe
+*.bat
+*.zip
+*.db
+
+# Directorio sqlite3 local (binario)
+sqlite3/
+
+# Archivos de sistema
+.DS_Store

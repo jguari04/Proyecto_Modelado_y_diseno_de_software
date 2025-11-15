@@ -1,0 +1,6 @@
+# Ver auditoría
+python3 check_project.py
+
+# Intentar arreglos mínimos
+python3 check_project.py --fix
+

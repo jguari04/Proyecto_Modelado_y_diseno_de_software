@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -e
+PROJ="$HOME/Documentos/02_Desarrollo/Finanza (POO)/FINANZASPORTABLE"
+source "$PROJ/.venv/bin/activate"
+cd "$PROJ"
+exec python -m app.gui_mp "$@"

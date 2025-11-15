@@ -1,0 +1,209 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import sys, json, tkinter as tk
+from tkinter import ttk, messagebox, filedialog, simpledialog
+from pathlib import Path
+from datetime import date, datetime
+
+import ttkbootstrap as tb
+from ttkbootstrap.constants import *
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC  = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from finanzasportable.services.db import (
+    connect, ensure_schema, db_path_general, db_path_year, db_path_month
+)
+from finanzasportable.services.core_sync import ensure_core_cloned
+from finanzasportable.utils.formats import parse_amount, money
+
+# Fallbacks por si faltan servicios
+try:
+    from finanzasportable.services.transactions import listar_transacciones
+except Exception:
+    def listar_transacciones(_): return []
+try:
+    from finanzasportable.services.balances import listar_saldos_por_cuenta, total_saldo
+except Exception:
+    def listar_saldos_por_cuenta(_): return []
+    def total_saldo(_): return 0.0
+
+
+def build_section(parent: tk.Misc, title: str):
+    wrap = ttk.Frame(parent, padding=(8, 6, 8, 8))
+    head = ttk.Frame(wrap); head.pack(fill=tk.X, pady=(0, 6))
+    ttk.Label(head, text=title, font=("Helvetica", 11, "bold")).pack(side=tk.LEFT)
+    ttk.Separator(wrap).pack(fill=tk.X)
+    body = ttk.Frame(wrap); body.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+    return wrap, body
+
+
+class ImportWizard(tb.Toplevel):
+    def __init__(self, master, conn, default_account="General"):
+        super().__init__(master)
+        self.conn = conn
+        self.title("Importar CSV/Excel")
+        self.transient(master); self.grab_set()
+        self.geometry("760x560")
+
+        self.path_var   = tk.StringVar()
+        self.sheet_var  = tk.StringVar(value="")
+        self.header_var = tk.IntVar(value=0)
+        self.default_account = tk.StringVar(value=default_account)
+
+        self.df = None
+        self.columns = []
+
+        frm = ttk.Frame(self, padding=12); frm.pack(fill="both", expand=True)
+
+        r1 = ttk.Frame(frm); r1.pack(fill="x", pady=4)
+        ttk.Label(r1, text="Archivo (.csv / .xlsx)").pack(side="left")
+        ttk.Entry(r1, textvariable=self.path_var).pack(side="left", fill="x", expand=True, padx=6)
+        ttk.Button(r1, text="Buscar…", command=self.browse).pack(side="left")
+
+        r2 = ttk.Frame(frm); r2.pack(fill="x", pady=4)
+        ttk.Label(r2, text="Hoja (Excel)").pack(side="left")
+        self.sheet_cb = ttk.Combobox(r2, textvariable=self.sheet_var, width=28, state="readonly")
+        self.sheet_cb.pack(side="left", padx=6)
+        ttk.Label(r2, text="Fila encabezado").pack(side="left")
+        ttk.Spinbox(r2, from_=0, to=100, textvariable=self.header_var, width=6).pack(side="left", padx=6)
+        ttk.Button(r2, text="Previsualizar", command=self.preview).pack(side="left", padx=6)
+
+        mapf = ttk.LabelFrame(frm, text="Mapeo de columnas"); mapf.pack(fill="x", pady=8)
+        self.cmb = {}
+        for role in ["date","account","description","amount","currency"]:
+            fr = ttk.Frame(mapf); fr.pack(fill="x", pady=2)
+            ttk.Label(fr, text=role.capitalize(), width=14).pack(side="left")
+            cb = ttk.Combobox(fr, width=42, state="readonly"); cb.pack(side="left", fill="x", expand=True)
+            self.cmb[role] = cb
+
+        dfr = ttk.Frame(mapf); dfr.pack(fill="x", pady=2)
+        ttk.Label(dfr, text="Cuenta por defecto", width=14).pack(side="left")
+        ttk.Entry(dfr, textvariable=self.default_account).pack(side="left", fill="x", expand=True)
+
+        self.preview_box = tk.Text(frm, height=14); self.preview_box.pack(fill="both", expand=True, pady=(6,6))
+
+        br = ttk.Frame(frm); br.pack(fill="x")
+        ttk.Button(br, text="Cancelar", bootstyle=SECONDARY, command=self.destroy).pack(side="right", padx=6)
+        ttk.Button(br, text="Importar", bootstyle=PRIMARY, command=self.do_import).pack(side="right")
+
+    def browse(self):
+        p = filedialog.askopenfilename(
+            parent=self, title="Elegir archivo",
+            filetypes=[("CSV/Excel","*.csv *.xlsx *.xls"),("Todos","*.*")]
+        )
+        if not p: return
+        self.path_var.set(p)
+        if p.lower().endswith((".xlsx",".xls")):
+            try:
+                import pandas as pd
+                xls = pd.ExcelFile(p)
+                self.sheet_cb["values"] = xls.sheet_names
+                if xls.sheet_names:
+                    self.sheet_var.set(xls.sheet_names[0])
+            except Exception:
+                self.sheet_cb["values"] = []; self.sheet_var.set("")
+
+    def preview(self):
+        try:
+            import pandas as pd
+            p = Path(self.path_var.get())
+            if p.suffix.lower()==".csv":
+                df = pd.read_csv(p, header=self.header_var.get() if self.header_var.get()>=0 else 0)
+            else:
+                df = pd.read_excel(
+                    p,
+                    sheet_name=self.sheet_var.get() or None,
+                    header=self.header_var.get() if self.header_var.get()>=0 else 0
+                )
+        except Exception as e:
+            messagebox.showerror("Error leyendo", str(e), parent=self)
+            return
+
+        self.df = df
+        self.columns = [str(c) for c in df.columns]
+
+        def guess(col):
+            c = col.lower()
+            if "fecha" in c or "date" in c: return "date"
+            if "desc" in c: return "description"
+            if "monto" in c or "importe" in c or "amount" in c: return "amount"
+            if "cuenta" in c or "account" in c: return "account"
+            if "moneda" in c or "currency" in c: return "currency"
+            return ""
+
+        by_role = {"date":"","account":"","description":"","amount":"","currency":""}
+        for c in self.columns:
+            r = guess(c)
+            if r and not by_role[r]:
+                by_role[r] = c
+
+        for role, cb in self.cmb.items():
+            cb["values"] = self.columns
+            cb.set(by_role[role] or "")
+
+        self.preview_box.delete("1.0","end")
+        try:
+            self.preview_box.insert("end", df.head(30).to_string())
+        except Exception:
+            self.preview_box.insert("end", str(df.head(30)))
+
+    def do_import(self):
+        if self.df is None:
+            messagebox.showwarning("Atención","Primero previsualizá y mapeá.", parent=self)
+            return
+
+        mapping = {role:self.cmb[role].get() or None for role in self.cmb}
+        defaults = {"account": self.default_account.get().strip() or "General", "currency": "ARS"}
+
+        try:
+            import pandas as pd
+            df = self.df.copy()
+
+            if mapping["date"]:
+                df["posted_at"] = pd.to_datetime(df[mapping["date"]], errors="coerce").dt.date.astype(str)
+            else:
+                df["posted_at"] = date.today().isoformat()
+
+            df["description"] = df[mapping["description"]].astype(str) if mapping["description"] else ""
+
+            def _p(x):
+                try:
+                    return float(str(x).replace(".","").replace(",","."))  # 5.000,00 -> 5000.00
+                except:
+                    return 0.0
+            df["amount"] = df[mapping["amount"]].apply(_p) if mapping["amount"] else 0.0
+
+            df["account"] = df[mapping["account"]].astype(str) if mapping["account"] else defaults["account"]
+            df["currency"] = df[mapping["currency"]].astype(str) if mapping["currency"] else defaults["currency"]
+
+            with self.conn as con:
+                for acc_name in sorted(set(df["account"])):
+                    row = con.execute("SELECT id FROM account WHERE name=?", (acc_name,)).fetchone()
+                    if not row:
+                        con.execute(
+                            "INSERT INTO account(institution_id, name, type, currency, metadata) VALUES (?,?,?,?,?)",
+                            (None, acc_name, "wallet", "ARS", json.dumps({"position": 10**9}))
+                        )
+
+                n_tx = 0
+                for _, r in df.iterrows():
+                    acc = con.execute("SELECT id, currency FROM account WHERE name=?", (r["account"],)).fetchone()
+                    if not acc:
+                        continue
+                    con.execute(
+                        "INSERT INTO transactions(account_id, posted_at, description, amount, currency) VALUES (?,?,?,?,?)",
+                        (acc[0], r["posted_at"], str(r["description"] or ""), float(r["amount"] or 0.0), acc[1] or r["currency"])
+                    )
+                    n_tx += 1
+
+            messagebox.showinfo("Importar", f"Se importaron {n_tx} movimientos.", parent=self)
+            self.destroy()
+        except Exception as e:
+            messagebox.showerror("Error importando", str(e), parent=self)
+
+
+    app.mainloop()

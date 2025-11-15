@@ -1,0 +1,906 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import sys, json, tkinter as tk
+from tkinter import ttk, messagebox, filedialog, simpledialog
+from pathlib import Path
+from datetime import date, datetime
+
+import ttkbootstrap as tb
+from ttkbootstrap.constants import *
+
+# --- paths / sys.path ---
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+# --- proyecto ---
+from finanzasportable.services.db import (
+    connect,
+    ensure_schema,
+    db_path_general,
+    db_path_year,
+    db_path_month,
+)
+from finanzasportable.services.core_sync import ensure_core_cloned
+from finanzasportable.utils.formats import parse_amount, money
+
+# fallbacks (si falta algún servicio, la GUI no rompe)
+try:
+    from finanzasportable.services.transactions import listar_transacciones
+except Exception:
+
+    def listar_transacciones(_):
+        return []
+
+
+try:
+    from finanzasportable.services.balances import listar_saldos_por_cuenta, total_saldo
+except Exception:
+
+    def listar_saldos_por_cuenta(_):
+        return []
+
+    def total_saldo(_):
+        return 0.0
+
+
+# ---------- Helpers ----------
+def build_section(parent: tk.Misc, title: str):
+    wrap = ttk.Frame(parent, padding=(8, 6, 8, 8))
+    head = ttk.Frame(wrap)
+    head.pack(fill=tk.X, pady=(0, 6))
+    ttk.Label(head, text=title, font=("Helvetica", 11, "bold")).pack(side=tk.LEFT)
+    ttk.Separator(wrap).pack(fill=tk.X)
+    body = ttk.Frame(wrap)
+    body.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+    return wrap, body
+
+
+# ---------- ImportWizard ----------
+class ImportWizard(tb.Toplevel):
+    def __init__(self, master, conn, default_account="General"):
+        super().__init__(master)
+        self.conn = conn
+        self.title("Importar CSV/Excel")
+        self.transient(master)
+        self.grab_set()
+        self.geometry("760x560")
+        self.resizable(True, True)
+
+        self.path_var = tk.StringVar()
+        self.sheet_var = tk.StringVar(value="")
+        self.header_var = tk.IntVar(value=0)
+        self.default_account = tk.StringVar(value=default_account)
+
+        self.df = None
+        self.columns = []
+
+        frm = ttk.Frame(self, padding=12)
+        frm.pack(fill="both", expand=True)
+
+        r1 = ttk.Frame(frm)
+        r1.pack(fill="x", pady=4)
+        ttk.Label(r1, text="Archivo (.csv / .xlsx)").pack(side="left")
+        ttk.Entry(r1, textvariable=self.path_var).pack(
+            side="left", fill="x", expand=True, padx=6
+        )
+        ttk.Button(r1, text="Buscar…", command=self.browse).pack(side="left")
+
+        r2 = ttk.Frame(frm)
+        r2.pack(fill="x", pady=4)
+        ttk.Label(r2, text="Hoja (Excel)").pack(side="left")
+        self.sheet_cb = ttk.Combobox(
+            r2, textvariable=self.sheet_var, width=28, state="readonly"
+        )
+        self.sheet_cb.pack(side="left", padx=6)
+        ttk.Label(r2, text="Fila encabezado").pack(side="left")
+        ttk.Spinbox(r2, from_=0, to=100, textvariable=self.header_var, width=6).pack(
+            side="left", padx=6
+        )
+        ttk.Button(r2, text="Previsualizar", command=self.preview).pack(
+            side="left", padx=6
+        )
+
+        mapf = ttk.LabelFrame(frm, text="Mapeo de columnas")
+        mapf.pack(fill="x", pady=8)
+        self.cmb = {}
+        for role in ["date", "account", "description", "amount", "currency"]:
+            fr = ttk.Frame(mapf)
+            fr.pack(fill="x", pady=2)
+            ttk.Label(fr, text=role.capitalize(), width=14).pack(side="left")
+            cb = ttk.Combobox(fr, width=42, state="readonly")
+            cb.pack(side="left", fill="x", expand=True)
+            self.cmb[role] = cb
+
+        dfr = ttk.Frame(mapf)
+        dfr.pack(fill="x", pady=2)
+        ttk.Label(dfr, text="Cuenta por defecto", width=14).pack(side="left")
+        ttk.Entry(dfr, textvariable=self.default_account).pack(
+            side="left", fill="x", expand=True
+        )
+
+        self.preview_box = tk.Text(frm, height=14)
+        self.preview_box.pack(fill="both", expand=True, pady=(6, 6))
+
+        br = ttk.Frame(frm)
+        br.pack(fill="x")
+        ttk.Button(br, text="Cancelar", bootstyle=SECONDARY, command=self.destroy).pack(
+            side="right", padx=6
+        )
+        ttk.Button(br, text="Importar", bootstyle=PRIMARY, command=self.do_import).pack(
+            side="right"
+        )
+
+    def browse(self):
+        p = filedialog.askopenfilename(
+            parent=self,
+            title="Elegir archivo",
+            filetypes=[("CSV/Excel", "*.csv *.xlsx *.xls"), ("Todos", "*.*")],
+        )
+        if not p:
+            return
+        self.path_var.set(p)
+        if p.lower().endswith((".xlsx", ".xls")):
+            try:
+                import pandas as pd
+
+                xls = pd.ExcelFile(p)
+                self.sheet_cb["values"] = xls.sheet_names
+                if xls.sheet_names:
+                    self.sheet_var.set(xls.sheet_names[0])
+            except Exception:
+                self.sheet_cb["values"] = []
+                self.sheet_var.set("")
+
+    def preview(self):
+        try:
+            import pandas as pd
+
+            p = Path(self.path_var.get())
+            if p.suffix.lower() == ".csv":
+                df = pd.read_csv(
+                    p, header=self.header_var.get() if self.header_var.get() >= 0 else 0
+                )
+            else:
+                df = pd.read_excel(
+                    p,
+                    sheet_name=self.sheet_var.get() or None,
+                    header=self.header_var.get() if self.header_var.get() >= 0 else 0,
+                )
+        except Exception as e:
+            messagebox.showerror("Error leyendo", str(e), parent=self)
+            return
+
+        self.df = df
+        self.columns = [str(c) for c in df.columns]
+
+        # sugerencias básicas
+        def guess(col):
+            c = col.lower()
+            if "fecha" in c or "date" in c:
+                return "date"
+            if "desc" in c:
+                return "description"
+            if "monto" in c or "importe" in c or "amount" in c:
+                return "amount"
+            if "cuenta" in c or "account" in c:
+                return "account"
+            if "moneda" in c or "currency" in c:
+                return "currency"
+            return ""
+
+        by_role = {
+            "date": "",
+            "account": "",
+            "description": "",
+            "amount": "",
+            "currency": "",
+        }
+        for c in self.columns:
+            r = guess(c)
+            if r and not by_role[r]:
+                by_role[r] = c
+        for role, cb in self.cmb.items():
+            cb["values"] = self.columns
+            cb.set(by_role[role] or "")
+
+        self.preview_box.delete("1.0", "end")
+        self.preview_box.insert("end", df.head(30).to_string())
+
+    def do_import(self):
+        if self.df is None:
+            messagebox.showwarning(
+                "Atención", "Primero previsualizá y mapeá.", parent=self
+            )
+            return
+        mapping = {role: self.cmb[role].get() or None for role in self.cmb}
+        defaults = {
+            "account": self.default_account.get().strip() or "General",
+            "currency": "ARS",
+        }
+        try:
+            import pandas as pd
+
+            df = self.df.copy()
+
+            # fecha
+            if mapping["date"]:
+                df["posted_at"] = pd.to_datetime(
+                    df[mapping["date"]], errors="coerce"
+                ).dt.date.astype(str)
+            else:
+                df["posted_at"] = date.today().isoformat()
+
+            # desc
+            df["description"] = (
+                df[mapping["description"]].astype(str) if mapping["description"] else ""
+            )
+
+            # amount
+            def _p(x):
+                try:
+                    return float(
+                        str(x).replace(".", "").replace(",", ".")
+                    )  # 5.000,00 -> 5000.00
+                except:
+                    return 0.0
+
+            df["amount"] = df[mapping["amount"]].apply(_p) if mapping["amount"] else 0.0
+
+            # account / currency
+            df["account"] = (
+                df[mapping["account"]].astype(str)
+                if mapping["account"]
+                else defaults["account"]
+            )
+            df["currency"] = (
+                df[mapping["currency"]].astype(str)
+                if mapping["currency"]
+                else defaults["currency"]
+            )
+
+            # insertar
+            n_tx = 0
+            with self.conn as con:
+                # asegurar cuentas (si no existen)
+                for acc_name in sorted(set(df["account"])):
+                    row = con.execute(
+                        "SELECT id FROM account WHERE name=?", (acc_name,)
+                    ).fetchone()
+                    if not row:
+                        con.execute(
+                            "INSERT INTO account(institution_id, name, type, currency, metadata) VALUES (?,?,?,?,?)",
+                            (
+                                None,
+                                acc_name,
+                                "wallet",
+                                "ARS",
+                                json.dumps({"position": 10**9}),
+                            ),
+                        )
+                # insertar tx
+                for _, r in df.iterrows():
+                    acc = con.execute(
+                        "SELECT id, currency FROM account WHERE name=?", (r["account"],)
+                    ).fetchone()
+                    if not acc:
+                        continue
+                    con.execute(
+                        "INSERT INTO transactions(account_id, posted_at, description, amount, currency) VALUES (?,?,?,?,?)",
+                        (
+                            acc[0],
+                            r["posted_at"],
+                            str(r["description"] or ""),
+                            float(r["amount"] or 0.0),
+                            acc[1] or r["currency"],
+                        ),
+                    )
+                    n_tx += 1
+
+            messagebox.showinfo(
+                "Importar", f"Movimientos importados: {n_tx}", parent=self
+            )
+            self.destroy()
+        except Exception as e:
+            messagebox.showerror("Error importando", str(e), parent=self)
+
+
+# ---------- App principal ----------
+class MPApp(tb.Window):
+    def __init__(self):
+        super().__init__(title="Finanzas Portable", themename="darkly")
+        self.geometry("1100x680")
+
+        today = date.today()
+        self.scope_mode = tk.StringVar(value="general")  # general|year|month
+        self.scope_year = tk.IntVar(value=today.year)
+        self.scope_month = tk.IntVar(value=today.month)
+
+        self.db_path = self.current_path()
+
+        self._build_header()
+        self._build_body()
+
+        self.prepare_db()
+        self.refresh_all()
+
+    # --- Alcance / DB ---
+    def current_path(self) -> Path:
+        m = self.scope_mode.get()
+        if m == "general":
+            return db_path_general()
+        elif m == "year":
+            return db_path_year(self.scope_year.get())
+        else:
+            return db_path_month(self.scope_year.get(), self.scope_month.get())
+
+    def prepare_db(self):
+        """Asegura esquema y clona core (cuentas/categorías) desde GENERAL en el ámbito actual."""
+        self.db_path = self.current_path()
+        ensure_schema(self.db_path)
+        try:
+            # No pisa datos existentes: sólo asegura que existan las del GENERAL.
+            ensure_core_cloned(self.db_path)
+        except Exception:
+            pass
+
+    # --- Header ---
+    def _build_header(self):
+        hdr = ttk.Frame(self, padding=10)
+        hdr.pack(fill=tk.X)
+
+        # Izquierda: total disponible
+        left = ttk.Frame(hdr)
+        left.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(left, text="Disponible", font=("Helvetica", 10, "bold")).pack(
+            anchor="center"
+        )
+        self.total_var = tk.StringVar(value="$ 0,00")
+        ttk.Label(
+            left, textvariable=self.total_var, font=("Helvetica", 28, "bold")
+        ).pack(anchor="center")
+
+        # Derecha: ámbito + botones
+        right = ttk.Frame(hdr)
+        right.pack(side=tk.RIGHT)
+
+        row = ttk.Frame(right)
+        row.pack(anchor="e", pady=(0, 6))
+        ttk.Label(row, text="Ámbito:").pack(side=tk.LEFT, padx=(0, 6))
+        self.cmb_scope = ttk.Combobox(
+            row, state="readonly", values=["General", "Año", "Mes"], width=10
+        )
+        self.cmb_scope.current(0)
+        self.cmb_scope.pack(side=tk.LEFT)
+        self.cmb_scope.bind("<<ComboboxSelected>>", lambda _e: self.on_scope_change())
+
+        ttk.Label(row, text="Año").pack(side=tk.LEFT, padx=(8, 2))
+        self.sp_year = ttk.Spinbox(
+            row, from_=2000, to=2100, width=6, textvariable=self.scope_year
+        )
+        self.sp_year.pack(side=tk.LEFT)
+        ttk.Label(row, text="Mes").pack(side=tk.LEFT, padx=(8, 2))
+        self.sp_month = ttk.Spinbox(
+            row, from_=1, to=12, width=4, textvariable=self.scope_month
+        )
+        self.sp_month.pack(side=tk.LEFT)
+
+        btns = ttk.Frame(right)
+        btns.pack(anchor="e")
+        ttk.Button(
+            btns, text="Añadir", bootstyle=SUCCESS, command=self.open_add_modal
+        ).pack(side=tk.LEFT, padx=6)
+        ttk.Button(
+            btns, text="Actualizar", bootstyle=PRIMARY, command=self.refresh_all
+        ).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="Importar", bootstyle=INFO, command=self.on_import).pack(
+            side=tk.LEFT, padx=6
+        )
+        ttk.Button(
+            btns, text="Exportar", bootstyle=INFO, command=self.export_to_excel
+        ).pack(side=tk.LEFT, padx=6)
+        ttk.Button(
+            btns,
+            text="Cuentas…",
+            bootstyle=SECONDARY,
+            command=self.open_accounts_manager,
+        ).pack(side=tk.LEFT, padx=6)
+        ttk.Button(
+            btns,
+            text="Categorías…",
+            bootstyle=SECONDARY,
+            command=self.open_categories_manager,
+        ).pack(side=tk.LEFT, padx=6)
+
+    def on_scope_change(self):
+        sel = self.cmb_scope.get()
+        self.scope_mode.set(
+            "general" if sel == "General" else "year" if sel == "Año" else "month"
+        )
+        self.sp_year.configure(
+            state="normal" if self.scope_mode.get() in ("year", "month") else "disabled"
+        )
+        self.sp_month.configure(
+            state="normal" if self.scope_mode.get() == "month" else "disabled"
+        )
+        self.prepare_db()
+        self.refresh_all()
+
+    # --- Body ---
+    def _build_body(self):
+        body = ttk.Frame(self, padding=(10, 0, 10, 10))
+        body.pack(fill=tk.BOTH, expand=True)
+
+        left_wrap, left_body = build_section(body, "Saldos por cuenta")
+        left_wrap.pack(side=tk.LEFT, fill=tk.Y)
+        self.left_list = ttk.Frame(left_body)
+        self.left_list.pack(fill=tk.BOTH, expand=True)
+
+        center_wrap, center_body = build_section(body, "Tu última actividad")
+        center_wrap.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0))
+        columns = ("fecha", "desc", "tipo", "monto", "cuenta")
+        self.tv = ttk.Treeview(center_body, columns=columns, show="headings", height=18)
+        for key, title in zip(
+            columns, ["Fecha", "Descripción", "Tipo", "Monto", "Cuenta"]
+        ):
+            self.tv.heading(key, text=title)
+        self.tv.column("fecha", width=110, anchor=tk.W)
+        self.tv.column("desc", width=420, anchor=tk.W)
+        self.tv.column("tipo", width=90, anchor=tk.CENTER)
+        self.tv.column("monto", width=140, anchor=tk.E)
+        self.tv.column("cuenta", width=180, anchor=tk.W)
+        self.tv.pack(fill=tk.BOTH, expand=True)
+        self.tv.tag_configure("ingreso", foreground="#31c48d")
+        self.tv.tag_configure("egreso", foreground="#e02424")
+        self.tv.tag_configure("neutro", foreground="#cbd5e1")
+        sc = ttk.Scrollbar(center_body, orient="vertical", command=self.tv.yview)
+        self.tv.configure(yscrollcommand=sc.set)
+        sc.place(relx=1.0, rely=0, relheight=1.0, anchor="ne")
+
+    # --- Cuentas (UI sencilla) ---
+    def get_accounts(self):
+        with connect(self.db_path) as con:
+            rows = con.execute(
+                "SELECT id, name, currency FROM account ORDER BY name"
+            ).fetchall()
+        return [{"id": r[0], "name": r[1], "currency": r[2]} for r in rows]
+
+    def open_accounts_manager(self):
+        win = tb.Toplevel(self)
+        win.title("Cuentas")
+        win.transient(self)
+        win.grab_set()
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        lst = tk.Listbox(frm, height=14, activestyle="dotbox")
+        lst.grid(row=0, column=0, rowspan=6, sticky="nswe")
+        frm.columnconfigure(0, weight=1)
+
+        def reload_list():
+            accs = self.get_accounts()
+            lst.delete(0, tk.END)
+            for a in accs:
+                lst.insert(tk.END, f"{a['name']} ({a['currency']})")
+
+        def new_account():
+            self._open_new_account_modal(
+                parent=win, on_created=lambda _a: reload_list()
+            )
+
+        def rename_selected():
+            sel = lst.curselection()
+            if not sel:
+                return
+            old = lst.get(sel[0]).rsplit(" (", 1)[0]
+            new = simpledialog.askstring(
+                "Renombrar cuenta", "Nuevo nombre:", initialvalue=old, parent=win
+            )
+            if not new or new.strip() == old:
+                return
+            with connect(self.db_path) as con:
+                con.execute(
+                    "UPDATE account SET name=? WHERE name=?", (new.strip(), old)
+                )
+            reload_list()
+            self.refresh_all()
+
+        def delete_selected():
+            sel = lst.curselection()
+            if not sel:
+                return
+            name = lst.get(sel[0]).rsplit(" (", 1)[0]
+            if not messagebox.askyesno(
+                "Eliminar", f"¿Eliminar cuenta «{name}»?", parent=win
+            ):
+                return
+            with connect(self.db_path) as con:
+                row = con.execute(
+                    "SELECT id FROM account WHERE name=?", (name,)
+                ).fetchone()
+                if row:
+                    con.execute("DELETE FROM account WHERE id=?", (row[0],))
+            reload_list()
+            self.refresh_all()
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=0, column=1, sticky="n", padx=8)
+        ttk.Button(btns, text="Nueva…", bootstyle=SUCCESS, command=new_account).pack(
+            fill=tk.X, pady=2
+        )
+        ttk.Button(
+            btns, text="Renombrar…", bootstyle=SECONDARY, command=rename_selected
+        ).pack(fill=tk.X, pady=2)
+        ttk.Button(
+            btns, text="Eliminar…", bootstyle=DANGER, command=delete_selected
+        ).pack(fill=tk.X, pady=2)
+        ttk.Button(btns, text="Cerrar", bootstyle=SECONDARY, command=win.destroy).pack(
+            fill=tk.X, pady=8
+        )
+
+        reload_list()
+
+    def _open_new_account_modal(self, parent, on_created=None):
+        win = tb.Toplevel(parent)
+        win.title("Nueva cuenta")
+        win.transient(parent)
+        win.grab_set()
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        name_var = tk.StringVar(value="")
+        type_var = tk.StringVar(value="wallet")
+        curr_var = tk.StringVar(value="ARS")
+
+        ttk.Label(frm, text="Nombre").grid(row=0, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=name_var, width=34).grid(
+            row=0, column=1, sticky="w", padx=6, pady=4
+        )
+        ttk.Label(frm, text="Tipo").grid(row=1, column=0, sticky="w")
+        ttk.Combobox(
+            frm,
+            values=["cash", "wallet", "checking", "savings", "brokerage", "card"],
+            state="readonly",
+            textvariable=type_var,
+            width=20,
+        ).grid(row=1, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(frm, text="Moneda").grid(row=2, column=0, sticky="w")
+        ttk.Combobox(
+            frm,
+            values=["ARS", "USD", "EUR"],
+            state="readonly",
+            textvariable=curr_var,
+            width=10,
+        ).grid(row=2, column=1, sticky="w", padx=6, pady=4)
+
+        bar = ttk.Frame(frm)
+        bar.grid(row=3, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(bar, text="Cancelar", bootstyle=SECONDARY, command=win.destroy).pack(
+            side=tk.RIGHT, padx=6
+        )
+
+        def crear():
+            nombre = (name_var.get() or "").strip()
+            if not nombre:
+                messagebox.showwarning("Nueva cuenta", "Ingresá un nombre.", parent=win)
+                return
+            with connect(self.db_path) as con:
+                con.execute(
+                    "INSERT INTO account(institution_id, name, type, currency, metadata) VALUES (?,?,?,?,?)",
+                    (
+                        None,
+                        nombre,
+                        type_var.get(),
+                        curr_var.get(),
+                        json.dumps({"position": 10**9}),
+                    ),
+                )
+            win.destroy()
+            self.refresh_all()
+            if on_created:
+                on_created({"name": nombre})
+
+        ttk.Button(bar, text="Crear", bootstyle=SUCCESS, command=crear).pack(
+            side=tk.RIGHT
+        )
+
+    # --- Categorías (UI sencilla) ---
+    def open_categories_manager(self):
+        win = tb.Toplevel(self)
+        win.title("Categorías")
+        win.transient(self)
+        win.grab_set()
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        lst = tk.Listbox(frm, height=14, activestyle="dotbox")
+        lst.grid(row=0, column=0, rowspan=6, sticky="nswe")
+        frm.columnconfigure(0, weight=1)
+
+        def reload_list():
+            with connect(self.db_path) as con:
+                rows = con.execute(
+                    "SELECT id, name FROM category ORDER BY name"
+                ).fetchall()
+            lst.delete(0, tk.END)
+            for _id, name in rows:
+                lst.insert(tk.END, name)
+
+        def new_cat():
+            name = simpledialog.askstring("Nueva categoría", "Nombre:", parent=win)
+            if not name:
+                return
+            with connect(self.db_path) as con:
+                con.execute(
+                    "INSERT OR IGNORE INTO category(name) VALUES(?)", (name.strip(),)
+                )
+            reload_list()
+
+        def rename_cat():
+            sel = lst.curselection()
+            if not sel:
+                return
+            old = lst.get(sel[0])
+            new = simpledialog.askstring(
+                "Renombrar categoría", "Nuevo nombre:", initialvalue=old, parent=win
+            )
+            if not new or new.strip() == old:
+                return
+            with connect(self.db_path) as con:
+                con.execute(
+                    "UPDATE category SET name=? WHERE name=?", (new.strip(), old)
+                )
+            reload_list()
+
+        def delete_cat():
+            sel = lst.curselection()
+            if not sel:
+                return
+            name = lst.get(sel[0])
+            if not messagebox.askyesno("Eliminar", f"¿Eliminar «{name}»?", parent=win):
+                return
+            with connect(self.db_path) as con:
+                con.execute("DELETE FROM category WHERE name=?", (name,))
+            reload_list()
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=0, column=1, sticky="n", padx=8)
+        ttk.Button(btns, text="Nueva…", bootstyle=SUCCESS, command=new_cat).pack(
+            fill=tk.X, pady=2
+        )
+        ttk.Button(
+            btns, text="Renombrar…", bootstyle=SECONDARY, command=rename_cat
+        ).pack(fill=tk.X, pady=2)
+        ttk.Button(btns, text="Eliminar…", bootstyle=DANGER, command=delete_cat).pack(
+            fill=tk.X, pady=2
+        )
+        ttk.Button(btns, text="Cerrar", bootstyle=SECONDARY, command=win.destroy).pack(
+            fill=tk.X, pady=8
+        )
+
+        reload_list()
+
+    # --- Operaciones ---
+    def open_add_modal(self):
+        win = tb.Toplevel(self)
+        win.title("Añadir movimiento")
+        win.transient(self)
+        win.grab_set()
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        accounts = self.get_accounts()
+        if not accounts:
+            ttk.Label(
+                frm,
+                text="No hay cuentas en este ámbito.\nCreá una desde «Cuentas…».",
+                foreground="#ff8080",
+            ).grid(row=0, column=0, columnspan=2, sticky="w")
+            ttk.Button(frm, text="Cerrar", command=win.destroy).grid(
+                row=1, column=1, sticky="e", padx=6, pady=8
+            )
+            return
+
+        acc_labels = [f"{a['name']} ({a['currency']})" for a in accounts]
+        acc_var = tk.StringVar(value=acc_labels[0])
+        date_var = tk.StringVar(value=date.today().isoformat())
+        desc_var = tk.StringVar(value="")
+        monto_var = tk.StringVar(value="")
+        tipo_var = tk.IntVar(value=1)  # 1 ingreso / -1 egreso
+
+        ttk.Label(frm, text="Cuenta").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(
+            frm, values=acc_labels, state="readonly", width=40, textvariable=acc_var
+        ).grid(row=0, column=1, sticky="ew", padx=6, pady=4)
+
+        ttk.Label(frm, text="Fecha (YYYY-MM-DD)").grid(row=1, column=0, sticky="w")
+        ttk.Entry(frm, width=16, textvariable=date_var).grid(
+            row=1, column=1, sticky="w", padx=6, pady=4
+        )
+
+        ttk.Label(frm, text="Descripción").grid(row=2, column=0, sticky="w")
+        ttk.Entry(frm, width=42, textvariable=desc_var).grid(
+            row=2, column=1, sticky="ew", padx=6, pady=4
+        )
+
+        ttk.Label(frm, text="Tipo").grid(row=3, column=0, sticky="w")
+        box = ttk.Frame(frm)
+        box.grid(row=3, column=1, sticky="w", padx=6, pady=4)
+        ttk.Radiobutton(box, text="Ingreso (+)", variable=tipo_var, value=1).pack(
+            side=tk.LEFT, padx=(0, 10)
+        )
+        ttk.Radiobutton(box, text="Egreso (–)", variable=tipo_var, value=-1).pack(
+            side=tk.LEFT
+        )
+
+        ttk.Label(frm, text="Monto").grid(row=4, column=0, sticky="w")
+        ent_monto = ttk.Entry(frm, width=20, textvariable=monto_var)
+        ent_monto.grid(row=4, column=1, sticky="w", padx=6, pady=4)
+
+        bar = ttk.Frame(frm)
+        bar.grid(row=5, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(bar, text="Cancelar", bootstyle=SECONDARY, command=win.destroy).pack(
+            side=tk.RIGHT, padx=6
+        )
+
+        def _validar_fecha(s: str) -> str:
+            s = (s or "").strip()
+            try:
+                return datetime.strptime(s, "%Y-%m-%d").date().isoformat()
+            except Exception:
+                raise ValueError("La fecha debe ser YYYY-MM-DD (ej: 2025-10-12).")
+
+        def guardar():
+            try:
+                idx = (
+                    acc_labels.index(acc_var.get())
+                    if acc_var.get() in acc_labels
+                    else 0
+                )
+                acc_id = accounts[idx]["id"]
+                posted = _validar_fecha(date_var.get())
+                desc = (desc_var.get() or "").strip()
+                amt_raw = parse_amount(monto_var.get())
+                amt = abs(amt_raw) * (1 if tipo_var.get() >= 0 else -1)
+                with connect(self.db_path) as con:
+                    row = con.execute(
+                        "SELECT currency FROM account WHERE id=?", (acc_id,)
+                    ).fetchone()
+                    if not row:
+                        raise RuntimeError("Cuenta no encontrada.")
+                    con.execute(
+                        "INSERT INTO transactions(account_id, posted_at, description, amount, currency) VALUES (?,?,?,?,?)",
+                        (acc_id, posted, desc, amt, row[0]),
+                    )
+                win.destroy()
+                self.refresh_all()
+            except ValueError as e:
+                messagebox.showerror(
+                    "Datos inválidos",
+                    f"{e}\nEj: 5000 | 5.000,00 | -1.200,50 | $ 1.234,56",
+                    parent=win,
+                )
+            except Exception as e:
+                messagebox.showerror("Error al guardar", str(e), parent=win)
+
+        ttk.Button(bar, text="Guardar", bootstyle=SUCCESS, command=guardar).pack(
+            side=tk.RIGHT
+        )
+        frm.columnconfigure(1, weight=1)
+        win.bind("<Escape>", lambda e: win.destroy())
+        ent_monto.bind("<Return>", lambda e: guardar())
+
+    # --- Importar / Exportar ---
+    def on_import(self):
+        conn = connect(self.db_path)
+        try:
+            wiz = ImportWizard(self, conn)
+            self.wait_window(wiz)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self.refresh_all()
+
+    def export_to_excel(self):
+        try:
+            import pandas as pd  # requiere openpyxl
+        except Exception:
+            messagebox.showerror("Exportar", "Necesitás instalar pandas y openpyxl.")
+            return
+
+        save_path = filedialog.asksaveasfilename(
+            title="Guardar como",
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx"), ("Todos", "*.*")],
+        )
+        if not save_path:
+            return
+
+        try:
+            with connect(self.db_path) as con:
+                acc = con.execute(
+                    "SELECT id, name, currency FROM account ORDER BY name"
+                ).fetchall()
+                tx = con.execute(
+                    "SELECT t.id, t.posted_at, t.description, t.amount, t.currency, a.name AS account_name "
+                    "FROM transactions t JOIN account a ON a.id=t.account_id "
+                    "ORDER BY t.posted_at, t.id"
+                ).fetchall()
+
+            import pandas as pd
+
+            df_acc = pd.DataFrame(acc, columns=["id", "name", "currency"])
+            df_tx = pd.DataFrame(
+                tx,
+                columns=[
+                    "id",
+                    "posted_at",
+                    "description",
+                    "amount",
+                    "currency",
+                    "account_name",
+                ],
+            )
+
+            with pd.ExcelWriter(save_path, engine="openpyxl") as xw:
+                df_acc.to_excel(xw, index=False, sheet_name="accounts")
+                df_tx.to_excel(xw, index=False, sheet_name="transactions")
+
+            messagebox.showinfo("Exportar", f"Archivo guardado en:\n{save_path}")
+        except Exception as e:
+            messagebox.showerror("Exportar", f"Error exportando: {e}")
+
+    # --- Carga de datos / Refresh ---
+    def load_balances(self):
+        for w in list(self.left_list.winfo_children()):
+            w.destroy()
+
+        rows = listar_saldos_por_cuenta(self.db_path)
+        total = total_saldo(self.db_path)
+
+        grp = ttk.Frame(self.left_list)
+        grp.pack(anchor="center")
+        for _id, name, curr, bal, _meta in rows:
+            card = ttk.Frame(grp, padding=6, bootstyle=SECONDARY)
+            card.pack(fill=tk.X, pady=4)
+            ttk.Label(
+                card, text=name, font=("Helvetica", 12, "bold"), anchor="center"
+            ).pack(fill="x")
+            ttk.Label(card, text=curr, anchor="center").pack(fill="x")
+            ttk.Label(
+                card,
+                text=money(bal, curr),
+                font=("Helvetica", 12, "bold"),
+                anchor="center",
+            ).pack(fill="x")
+
+        self.total_var.set(money(total))
+
+    def load_activity(self):
+        for i in self.tv.get_children():
+            self.tv.delete(i)
+        rows = listar_transacciones(self.db_path)
+        for tx_id, posted_at, desc, amount, acc_name in rows:
+            tag = "ingreso" if amount > 0 else "egreso" if amount < 0 else "neutro"
+            tipo = "Ingreso" if amount > 0 else "Egreso" if amount < 0 else "—"
+            self.tv.insert(
+                "",
+                "end",
+                iid=str(tx_id),
+                values=(posted_at, desc or "", tipo, money(amount), acc_name),
+                tags=(tag,),
+            )
+
+    def refresh_all(self):
+        self.prepare_db()
+        self.load_balances()
+        self.load_activity()
+
+
+if __name__ == "__main__":
+    app = MPApp()
+    app.mainloop()

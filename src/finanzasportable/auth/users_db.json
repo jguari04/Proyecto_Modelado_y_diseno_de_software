@@ -1,0 +1,9 @@
+{
+  "user-1": {
+    "nombre": "Usuario Demo",
+    "email": "demo@example.com",
+    "password_hash": "226e08b87560bca75f177325927b473442adf07dc49b508af5c076aecdd75f5c",
+    "estado": "activa",
+    "roles": []
+  }
+}
