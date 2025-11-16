@@ -338,7 +338,6 @@ Flujo:
 | RF5* | CU5 Solicitar acceso  | Usuario, Rol, Zona         | Secuencia acceso-denegación            |
 | RF7* | CU6 Registrar evento  | Auditoría, EventoAcceso    | Diagrama actividad                     |
 
-*Opcionales del profesor.
 
 ---
-te preparo **los diagramas en formato XML de draw.io** listos para importar. ¿Querés eso?
+
