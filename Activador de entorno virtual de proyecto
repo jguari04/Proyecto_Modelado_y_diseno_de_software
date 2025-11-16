@@ -1,0 +1,25 @@
+source .venv/bin/activate
+(.venv) ...
+
+PYTHONPATH="$PWD/src:$PYTHONPATH" python3 -m app.gui_auth
+
+
+
+------------------------------------------------------------------------------------------------
+A nivel CÓDIGO, RF1–RF4 están OK.
+
+Lo que falta no es programación, es documentación:
+
+Glosario
+
+Actores/metas
+
+Historias de usuario
+
+Casos de uso texto + diagramas
+
+Diagramas UML (casos de uso, clases, secuencia, actividad)
+
+Tabla de trazabilidad
+
+Eso lo tenemos medio armado en la conversación, y ahora es cuestión de que lo vuelques al TP.
