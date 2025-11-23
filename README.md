@@ -285,8 +285,6 @@ Relaciones:
 
 ## **5.3. Diagrama de Secuencia (Solicitar acceso y autorizar/denegar)**
 
-*(lo pide el profe aunque no esté implementado)*
-
 Participantes:
 
 ```
