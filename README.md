@@ -217,7 +217,8 @@ Formato estándar UML textual.
 
 # **5. Diagramas UML (para que los dibujes)**
 
-<img width="334" height="531" alt="image" src="https://github.com/user-attachments/assets/547d07e8-4c9f-4dd4-87d8-c5e3c6e453db" />
+<img width="334" height="531" alt="casos_uso" src="https://github.com/user-attachments/assets/88e8df5d-8ef6-42aa-9265-1263889ebd3e" />
+
 
 
 ---
