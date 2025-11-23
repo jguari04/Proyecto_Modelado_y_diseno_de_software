@@ -1,11 +1,5 @@
 # Proyecto_Modelado-y-diseño-de-software
 
-Perfecto, ahora vamos a **armar TODA la documentación lista para copiar/pegar** en tu TP, siguiendo EXACTAMENTE lo que pide el profesor en el PDF.
-
-> ⚠ Sin mezclar temas y en el orden solicitado por la consigna.
-> ⚠ Todo listo para entregar (texto 100% pulido).
-> ⚠ No incluimos nada del código aquí, solo la documentación del sistema.
-
 ---
 
 #  **DOCUMENTACIÓN COMPLETA DEL TP**
